@@ -13,9 +13,11 @@ Equivalent to R's FunctionsHDAM/EstimationFactors.R:
 
 import warnings
 import numpy as np
+from scipy.linalg import solve_triangular, cholesky as scipy_cholesky
 
 from .bspline import bspline_basis
 from .group_lasso import lambda_max_group, group_lasso_fista, group_lasso_path
+from .fit_deconfounded_hdam import _svd_full
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +40,8 @@ def estimate_qhat(X: np.ndarray) -> int:
     """
     n, p = X.shape
     q_max = round(min(n, p) / 2)
-    _, d, _ = np.linalg.svd(X, full_matrices=False)
+    # Use GPU-accelerated SVD via _svd_full (avoids ~1.4s OpenBLAS regression).
+    _, d = _svd_full(X)
     d = d[:q_max + 1]
     drat = d[:q_max] / d[1:q_max + 1]
     qhat = int(np.argmax(drat)) + 1   # +1 because argmax is 0-indexed
@@ -63,7 +66,8 @@ def estimate_Hhat(X: np.ndarray, qhat: int | None = None) -> np.ndarray:
     n = X.shape[0]
     if qhat is None:
         qhat = estimate_qhat(X)
-    U, _, _ = np.linalg.svd(X, full_matrices=False)
+    # Use GPU-accelerated SVD via _svd_full (avoids ~1.4s OpenBLAS regression).
+    U, _ = _svd_full(X)
     return np.sqrt(n) * U[:, :qhat]
 
 
@@ -98,11 +102,9 @@ def _build_basis_with_factors(X: np.ndarray, H: np.ndarray, K: int):
 
         Bj = bspline_basis(X[:, j], breaks)
         gram = Bj.T @ Bj / n
-        R_upper = np.linalg.cholesky(gram).T
-        Rj_inv = np.linalg.inv(R_upper)
-
-        B[:, j * K:(j + 1) * K] = Bj @ Rj_inv
-        Rlist.append(Rj_inv)
+        R_upper = scipy_cholesky(gram, lower=False)
+        B[:, j * K:(j + 1) * K] = solve_triangular(R_upper, Bj.T, lower=False).T
+        Rlist.append(R_upper)
 
     # [intercept | basis | H]  -- intercept and H are unpenalised
     B_full = np.column_stack([np.ones(n), B, H])
@@ -182,7 +184,7 @@ def _hdam_with_factors(
 
     Equivalent to R's HDAM.withFactors().
     """
-    n, p = X.shape
+    p = X.shape[1]
     K = basis_k
 
     B, Rlist, lbreaks, groups, unpen_mask = _build_basis_with_factors(X, H, K)
@@ -206,7 +208,8 @@ def _hdam_with_factors(
     active = []
     for j in range(p):
         cj = coef[1 + j * K: 1 + (j + 1) * K]
-        lcoef.append(Rlist[j] @ cj)
+        # Rlist[j] is R_upper; recover B-spline coefficients via triangular solve.
+        lcoef.append(solve_triangular(Rlist[j], cj, lower=False))
         if np.sum(cj ** 2) > 0:
             active.append(j)
 
@@ -248,7 +251,7 @@ def fit_hdam_with_factors(
     -------
     dict with keys: intercept, breaks, coefs, active, K_min
     """
-    n, p = X.shape
+    n = X.shape[0]
 
     if n_K > 10:
         n_K = 10

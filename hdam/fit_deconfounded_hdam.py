@@ -17,14 +17,103 @@ So:  R_upper = np.linalg.cholesky(A).T
 
 import warnings
 import numpy as np
+from scipy.linalg import solve_triangular, cholesky as scipy_cholesky
 
 from .bspline import bspline_basis
 from .group_lasso import lambda_max_group, group_lasso_fista, group_lasso_path
+
+# Optional GPU support — used to accelerate the SVD in _calc_trim_factors.
+# On this OpenBLAS USE64BITINT build, np.linalg.svd of a (300, p) matrix
+# takes ~1.4s regardless of p; torch.linalg.svd on CUDA takes ~15ms.
+try:
+    import torch as _torch
+    _HAS_GPU = _torch.cuda.is_available()
+except ImportError:
+    _torch = None
+    _HAS_GPU = False
+
+
+def _svd_full(X: np.ndarray):
+    """
+    Thin SVD of X, returning (U, d) with shapes (n, k) and (k,).
+
+    Uses CUDA when available to work around the severe performance
+    regression in the OpenBLAS USE64BITINT build on this system, where
+    np.linalg.svd of a (300, p) matrix takes ~1.4s vs ~15ms on GPU.
+    """
+    if _HAS_GPU:
+        X_g = _torch.tensor(X, device="cuda", dtype=_torch.float64)
+        U_g, d_g, _ = _torch.linalg.svd(X_g, full_matrices=False)
+        return U_g.cpu().numpy(), d_g.cpu().numpy()
+    U, d, _ = np.linalg.svd(X, full_matrices=False)
+    return U, d
 
 
 # ---------------------------------------------------------------------------
 # Spectral (trim) transformation
 # ---------------------------------------------------------------------------
+
+def _calc_trim_factors(X: np.ndarray):
+    """
+    Compute the SVD factors of the trim transformation without forming Q.
+
+    The trim matrix is Q = I - (U * w) @ U^T where:
+      - U  : left singular vectors of X,  shape (n, k),  k = min(n, p)
+      - w  : per-singular-value weights,  shape (k,)
+
+    Returning (U, w) instead of Q avoids allocating the dense (n, n) matrix.
+    Q can then be applied to any vector or matrix M as:
+        Q @ M  =  M - (U * w) @ (U^T @ M)   [see _apply_Q]
+
+    For k = min(n, p) << n this implicit form costs O(n*k) vs O(n^2).
+    Even when k = n (p >= n), the (n, n) allocation is avoided.
+
+    Returns
+    -------
+    U : ndarray (n, k)
+    w : ndarray (k,)
+    """
+    # Use GPU-accelerated SVD when available.  On this OpenBLAS build,
+    # np.linalg.svd for a (300, p) matrix takes ~1.4s; GPU takes ~15ms.
+    U, d = _svd_full(X)
+    d_tilde = np.minimum(d, np.median(d))
+    w = 1.0 - d_tilde / d
+    return U, w
+
+
+def _apply_Q(M: np.ndarray, U: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """
+    Apply Q = I - (U * w) @ U^T to M without forming the (n, n) Q matrix.
+
+    Q @ M  =  M - (U * w) @ (U^T @ M)
+
+    Works for M a vector (n,) or a matrix (n, c).  The two intermediate
+    products have shapes (k, c) and (n, c), both much smaller than (n, n)
+    when k = min(n, p) < n.
+
+    Parameters
+    ----------
+    M : ndarray (n,) or (n, c)
+    U : ndarray (n, k)   left singular vectors from _calc_trim_factors
+    w : ndarray (k,)     per-singular-value weights from _calc_trim_factors
+
+    GPU acceleration
+    ----------------
+    On this OpenBLAS USE64BITINT build, even a (50, 300) @ (300, 551) matmul
+    takes ~100ms.  For M with >= 400 columns, CUDA is 35-350x faster.
+    """
+    # Threshold at 400 columns: below that numpy is faster (GPU transfer
+    # overhead dominates); above that the OpenBLAS regression is worse.
+    n_cols = M.shape[1] if M.ndim == 2 else 1
+    if _HAS_GPU and n_cols >= 400:
+        device = "cuda"
+        M_g = _torch.tensor(M,   device=device, dtype=_torch.float64)
+        U_g = _torch.tensor(U,   device=device, dtype=_torch.float64)
+        w_g = _torch.tensor(w,   device=device, dtype=_torch.float64)
+        result = M_g - (U_g * w_g) @ (U_g.T @ M_g)
+        return result.cpu().numpy()
+    return M - (U * w) @ (U.T @ M)
+
 
 def calc_trim(X: np.ndarray) -> np.ndarray:
     """
@@ -44,14 +133,17 @@ def calc_trim(X: np.ndarray) -> np.ndarray:
     Returns
     -------
     Q : ndarray (n, n)
+
+    Notes
+    -----
+    This function materialises the full (n, n) Q matrix, which is useful
+    when callers need it directly.  Internal code uses _calc_trim_factors
+    together with _apply_Q to avoid allocating the (n, n) matrix.
     """
     n = X.shape[0]
-    # full_matrices=False gives U of shape (n, min(n,p)), matching R's svd()
-    U, d, _ = np.linalg.svd(X, full_matrices=False)
-    d_tilde = np.minimum(d, np.median(d))
-    # Diagonal weights: 1 - d_tilde/d
-    w = 1.0 - d_tilde / d
-    Q = np.eye(n) - (U * w) @ U.T  # equivalent to U @ diag(w) @ U.T
+    U, w = _calc_trim_factors(X)
+    # Reconstruct explicit Q for external callers.
+    Q = np.eye(n) - (U * w) @ U.T
     return Q
 
 
@@ -82,11 +174,12 @@ def _build_basis(X: np.ndarray, K: int):
 
         Bj = bspline_basis(X[:, j], breaks)          # (n, K)
         gram = Bj.T @ Bj / n                          # (K, K)
-        R_upper = np.linalg.cholesky(gram).T          # upper triangular
-        Rj_inv = np.linalg.inv(R_upper)               # (K, K)
-
-        B[:, j * K:(j + 1) * K] = Bj @ Rj_inv
-        Rlist.append(Rj_inv)
+        # scipy_cholesky with lower=False returns the upper factor R directly
+        # (R^T R = gram), equivalent to R's chol().  solve_triangular avoids
+        # forming the explicit inverse: B_orth = Bj R^{-1} = solve(R, Bj^T)^T.
+        R_upper = scipy_cholesky(gram, lower=False)   # upper triangular
+        B[:, j * K:(j + 1) * K] = solve_triangular(R_upper, Bj.T, lower=False).T
+        Rlist.append(R_upper)
 
     # Prepend intercept column
     B_full = np.column_stack([np.ones(n), B])         # (n, 1 + p*K)
@@ -175,9 +268,11 @@ def _deconfounded_hdam(
     B, Rlist, lbreaks, groups, unpen_mask = _build_basis(X, K)
 
     if meth == "trim":
-        Q = calc_trim(X)
-        QY = Q @ Y
-        QB = Q @ B
+        # Apply Q implicitly via (U, w) factors to avoid forming the (n, n)
+        # Q matrix and the O(n^2) matrix-matrix product Q @ B.
+        U, w = _calc_trim_factors(X)
+        QY = _apply_Q(Y, U, w)
+        QB = _apply_Q(B, U, w)
     elif meth == "none":
         QY = Y.copy()
         QB = B
@@ -203,7 +298,9 @@ def _deconfounded_hdam(
     active = []
     for j in range(p):
         cj = coef[1 + j * K: 1 + (j + 1) * K]
-        lcoef.append(Rlist[j] @ cj)
+        # Rlist[j] is R_upper (upper Cholesky factor).
+        # Original B-spline coefficients: alpha = R^{-1} cj_orth = solve(R, cj).
+        lcoef.append(solve_triangular(Rlist[j], cj, lower=False))
         if np.sum(cj ** 2) > 0:
             active.append(j)
 
@@ -281,12 +378,15 @@ def fit_deconfounded_hdam(
     K_up = round(10 * n ** 0.2)
     vK = np.round(np.linspace(4, K_up, n_K)).astype(int)
 
-    # Spectral transformation (computed once, shared across all K)
+    # Compute the spectral transformation once, shared across all K values.
+    # Using _calc_trim_factors + _apply_Q avoids forming the dense (n, n)
+    # Q matrix and keeps the per-K cost at O(n * k * (1 + p*K)) instead of
+    # O(n^2 * (1 + p*K)), where k = min(n, p).
     if meth == "trim":
-        Q = calc_trim(X)
-        QY = Q @ Y
+        U, w = _calc_trim_factors(X)
+        QY = _apply_Q(Y, U, w)
     elif meth == "none":
-        Q = np.eye(n)
+        U, w = None, None
         QY = Y.copy()
     else:
         raise ValueError("meth must be 'trim' or 'none'")
@@ -295,7 +395,12 @@ def fit_deconfounded_hdam(
     lmodK = []
     for K in vK:
         B, Rlist, lbreaks, groups, unpen_mask = _build_basis(X, K)
-        QB = Q @ B
+
+        # Apply the same Q to each basis matrix using the pre-computed factors.
+        if meth == "trim":
+            QB = _apply_Q(B, U, w)
+        else:
+            QB = B
 
         lam_max = lambda_max_group(QB, QY, groups, unpen_mask)
         lambdas = lam_max / (1000.0 ** (np.arange(n_lambda1) / (n_lambda1 - 1)))
