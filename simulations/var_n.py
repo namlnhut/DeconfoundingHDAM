@@ -130,7 +130,7 @@ def build_df(out_dir: Path, n_rep: int) -> pd.DataFrame:
             fname = out_dir / f"N_{n}_{tag}.pkl"
             if not fname.exists():
                 continue
-            rho_str = "00" if rho_val is None else str(int(rho_val * 100)).zfill(2)
+            rho_str = "00" if rho_val is None else str(int(rho_val * 10)).zfill(2)
             ci_str  = "decreasing" if dec else "equal"
             results = load_results(fname)
             for res in results[:n_rep]:

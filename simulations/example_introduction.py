@@ -35,7 +35,7 @@ if not results_path.exists():
 results = load_results(results_path)
 n_rep = min(100, len(results))
 
-mse_dec = [r["MSE"][0] for r in results[:n_rep]]  # deconfounded
+mse_dec = [r["MSE"][0] for r in results[:n_rep]]    # deconfounded
 mse_naive = [r["MSE"][1] for r in results[:n_rep]]  # naive
 act_dec = [r["active"][0] for r in results[:n_rep]]
 act_naive = [r["active"][1] for r in results[:n_rep]]
@@ -51,7 +51,7 @@ fig, axes = plt.subplots(1, 2, figsize=(9, 4))
 
 # --- Left: MSE histogram ---
 ax = axes[0]
-bins_mse = np.arange(0, 13.0, 0.25)
+bins_mse = np.arange(0, 13.0, 0.1)
 ax.hist(
     mse_dec,
     bins=bins_mse,
@@ -68,7 +68,7 @@ ax.legend(fontsize=9)
 
 # --- Right: active set size histogram ---
 ax = axes[1]
-bins_act = np.arange(0, 146, 5)
+bins_act = np.arange(0, 146, 1)
 ax.hist(
     act_dec,
     bins=bins_act,

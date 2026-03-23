@@ -54,7 +54,8 @@ def run_parallel(fn, args_list: list, n_cores: int = 4) -> list:
     """
     if n_cores == 1:
         return [fn(*a) for a in args_list]
-    with mp.Pool(n_cores) as pool:
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(n_cores) as pool:
         return pool.starmap(fn, args_list)
 
 
