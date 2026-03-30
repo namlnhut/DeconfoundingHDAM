@@ -22,9 +22,10 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hdam import fit_deconfounded_hdam, fit_hdam_with_est_factors, estimate_function
+from hdam.fit_deconfounded_hdam import _svd_full
 from _sim_utils import (
     f_true, PALETTE, METHS,
-    run_parallel, save_results, load_results, violin_plot,
+    run_parallel, make_pool, save_results, load_results, violin_plot,
 )
 
 # ---------------------------------------------------------------------------
@@ -71,10 +72,16 @@ def one_sim(n, q, p, seed_val, rho=None, decreasing_confounding=False):
     X = H @ Gamma + E
     Y = f_true(X) + H @ psi + e
 
+    # Compute SVD of centred X once; reuse across trim and est_factors fits.
+    # On this OpenBLAS build each SVD costs ~1.4s; sharing saves ~3 redundant calls.
+    precomputed_svd = _svd_full(X - X.mean(axis=0))
+
     kw = dict(n_K=5, cv_method="1se", cv_k=5, n_lambda1=10, n_lambda2=25)
-    lres_trim    = fit_deconfounded_hdam(Y, X.copy(), meth="trim", **kw)
+    lres_trim    = fit_deconfounded_hdam(Y, X.copy(), meth="trim",
+                                         precomputed_svd=precomputed_svd, **kw)
     lres_none    = fit_deconfounded_hdam(Y, X.copy(), meth="none", **kw)
-    lres_est_fac = fit_hdam_with_est_factors(Y, X.copy(), **kw)
+    lres_est_fac = fit_hdam_with_est_factors(Y, X.copy(),
+                                              precomputed_svd=precomputed_svd, **kw)
 
     n_test = 1000
     H_test = rng.standard_normal((n_test, q))
@@ -106,17 +113,25 @@ def run_simulations(out_dir: Path, n_rep: int, n_cores: int) -> None:
     rng_master = np.random.default_rng(1432)
     seed_vec = rng_master.integers(1, 2_100_000_000, size=n_rep).tolist()
 
-    for n in N_VEC:
-        for tag, rho, dec in SETTINGS:
-            fname = out_dir / f"N_{n}_{tag}.pkl"
-            if fname.exists():
-                print(f"[skip] {fname.name}")
-                continue
-            print(f"[run ] n={n}, {tag} ...")
-            args = [(n, Q, P, sv, rho, dec) for sv in seed_vec]
-            results = run_parallel(one_sim, args, n_cores)
-            save_results(results, fname)
-            print(f"       saved {fname.name}")
+    # Create the pool once and reuse it across all batches to avoid paying
+    # the spawn + CUDA-init overhead (~300 ms × n_cores) for every setting.
+    pool = make_pool(n_cores)
+    try:
+        for n in N_VEC:
+            for tag, rho, dec in SETTINGS:
+                fname = out_dir / f"N_{n}_{tag}.pkl"
+                if fname.exists():
+                    print(f"[skip] {fname.name}")
+                    continue
+                print(f"[run ] n={n}, {tag} ...")
+                args = [(n, Q, P, sv, rho, dec) for sv in seed_vec]
+                results = run_parallel(one_sim, args, n_cores, pool=pool)
+                save_results(results, fname)
+                print(f"       saved {fname.name}")
+    finally:
+        if pool is not None:
+            pool.terminate()
+            pool.join()
 
 
 # ---------------------------------------------------------------------------

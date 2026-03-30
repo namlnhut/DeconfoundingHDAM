@@ -48,8 +48,10 @@ except ImportError:
 
 # Column-count threshold above which CUDA is used instead of NumPy/OpenBLAS.
 # Below this value, GPU transfer overhead outweighs the BLAS regression.
-# Above this value (pcol ~2000+), CUDA is up to 1000x faster on this build.
-GPU_THRESHOLD = 1500
+# The OpenBLAS USE64BITINT regression is already severe at ~500 columns;
+# lowering from 1500 to 500 activates GPU acceleration for the common
+# HDAM regime (p=50-300, K=4-10 => 200-3000 columns).
+GPU_THRESHOLD = 500
 
 
 def _lipschitz_numpy(X: np.ndarray) -> float:

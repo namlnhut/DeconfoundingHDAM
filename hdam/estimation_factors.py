@@ -24,7 +24,7 @@ from .fit_deconfounded_hdam import _svd_full
 # Factor estimation
 # ---------------------------------------------------------------------------
 
-def estimate_qhat(X: np.ndarray) -> int:
+def estimate_qhat(X: np.ndarray, precomputed_svd=None) -> int:
     """
     Estimate the number of hidden confounders via the eigenvalue ratio method.
 
@@ -33,6 +33,8 @@ def estimate_qhat(X: np.ndarray) -> int:
     Parameters
     ----------
     X : ndarray (n, p)
+    precomputed_svd : tuple (U, d) or None
+        Pre-computed thin SVD of X.  When provided the SVD step is skipped.
 
     Returns
     -------
@@ -40,15 +42,18 @@ def estimate_qhat(X: np.ndarray) -> int:
     """
     n, p = X.shape
     q_max = round(min(n, p) / 2)
-    # Use GPU-accelerated SVD via _svd_full (avoids ~1.4s OpenBLAS regression).
-    _, d = _svd_full(X)
+    if precomputed_svd is not None:
+        _, d = precomputed_svd
+    else:
+        # Use GPU-accelerated SVD via _svd_full (avoids ~1.4s OpenBLAS regression).
+        _, d = _svd_full(X)
     d = d[:q_max + 1]
     drat = d[:q_max] / d[1:q_max + 1]
     qhat = int(np.argmax(drat)) + 1   # +1 because argmax is 0-indexed
     return qhat
 
 
-def estimate_Hhat(X: np.ndarray, qhat: int | None = None) -> np.ndarray:
+def estimate_Hhat(X: np.ndarray, qhat: int | None = None, precomputed_svd=None) -> np.ndarray:
     """
     Estimate the hidden factor matrix.
 
@@ -58,6 +63,8 @@ def estimate_Hhat(X: np.ndarray, qhat: int | None = None) -> np.ndarray:
     ----------
     X : ndarray (n, p)
     qhat : int or None  if None, estimated via estimate_qhat()
+    precomputed_svd : tuple (U, d) or None
+        Pre-computed thin SVD of X.  When provided the SVD step is skipped.
 
     Returns
     -------
@@ -65,9 +72,12 @@ def estimate_Hhat(X: np.ndarray, qhat: int | None = None) -> np.ndarray:
     """
     n = X.shape[0]
     if qhat is None:
-        qhat = estimate_qhat(X)
-    # Use GPU-accelerated SVD via _svd_full (avoids ~1.4s OpenBLAS regression).
-    U, _ = _svd_full(X)
+        qhat = estimate_qhat(X, precomputed_svd=precomputed_svd)
+    if precomputed_svd is not None:
+        U, _ = precomputed_svd
+    else:
+        # Use GPU-accelerated SVD via _svd_full (avoids ~1.4s OpenBLAS regression).
+        U, _ = _svd_full(X)
     return np.sqrt(n) * U[:, :qhat]
 
 
@@ -92,19 +102,25 @@ def _build_basis_with_factors(X: np.ndarray, H: np.ndarray, K: int):
     n, p = X.shape
     q = H.shape[1]
 
-    B = np.zeros((n, p * K))
-    Rlist = []
     lbreaks = []
+    all_Bj = []
+    grams = np.empty((p, K, K))
 
     for j in range(p):
         breaks = np.quantile(X[:, j], np.linspace(0, 1, K - 2))
         lbreaks.append(breaks)
-
         Bj = bspline_basis(X[:, j], breaks)
-        gram = Bj.T @ Bj / n
-        R_upper = scipy_cholesky(gram, lower=False)
-        B[:, j * K:(j + 1) * K] = solve_triangular(R_upper, Bj.T, lower=False).T
-        Rlist.append(R_upper)
+        all_Bj.append(Bj)
+        grams[j] = Bj.T @ Bj / n
+
+    # Batch Cholesky over all p predictors at once (same as _build_basis).
+    L_batch = np.linalg.cholesky(grams)          # (p, K, K) lower triangular
+    R_upper_batch = L_batch.swapaxes(-1, -2)     # (p, K, K) upper triangular
+
+    B = np.empty((n, p * K))
+    for j, Bj in enumerate(all_Bj):
+        B[:, j * K:(j + 1) * K] = solve_triangular(R_upper_batch[j], Bj.T, lower=False).T
+    Rlist = list(R_upper_batch)
 
     # [intercept | basis | H]  -- intercept and H are unpenalised
     B_full = np.column_stack([np.ones(n), B, H])
@@ -148,9 +164,7 @@ def _cv_hdam_with_factors(
 
         coefs = group_lasso_path(B_train, Y_train, groups, lambdas, unpen_mask)
         preds = B_test @ coefs
-
-        for li in range(n_lam):
-            mses[li, fold] = np.mean((Y_test - preds[:, li]) ** 2)
+        mses[:, fold] = np.mean((Y_test[:, None] - preds) ** 2, axis=0)
 
     mse_agg = mses.mean(axis=1)
     se_agg = mses.std(axis=1) / np.sqrt(k)
@@ -290,9 +304,7 @@ def fit_hdam_with_factors(
                 modK["groups"], modK["lambdas"], modK["unpen_mask"],
             )
             preds = B_test @ coefs
-
-            for li in range(n_lambda1):
-                MSES_agg[i, li] += np.mean((Y_test - preds[:, li]) ** 2) / cv_k
+            MSES_agg[i] += np.mean((Y_test[:, None] - preds) ** 2, axis=0) / cv_k
 
     idx_min = np.unravel_index(np.argmin(MSES_agg), MSES_agg.shape)
     K_min = int(vK[idx_min[0]])
@@ -316,6 +328,7 @@ def fit_hdam_with_est_factors(
     cv_k: int = 5,
     n_lambda1: int = 15,
     n_lambda2: int = 30,
+    precomputed_svd=None,
 ) -> dict:
     """
     Estimate hidden factors from X, then fit HDAM with those factors.
@@ -326,6 +339,9 @@ def fit_hdam_with_est_factors(
     ----------
     Y : ndarray (n,)
     X : ndarray (n, p)  will be mean-centred internally
+    precomputed_svd : tuple (U, d) or None
+        Pre-computed thin SVD of the *centred* X matrix.  When provided the
+        SVD calls inside estimate_qhat and estimate_Hhat are skipped.
 
     Returns
     -------
@@ -334,8 +350,8 @@ def fit_hdam_with_est_factors(
     Xmeans = X.mean(axis=0)
     X = X - Xmeans
 
-    qhat = estimate_qhat(X)
-    Hhat = estimate_Hhat(X, qhat=qhat)
+    qhat = estimate_qhat(X, precomputed_svd=precomputed_svd)
+    Hhat = estimate_Hhat(X, qhat=qhat, precomputed_svd=precomputed_svd)
 
     result = fit_hdam_with_factors(
         Y=Y, H=Hhat, X=X,

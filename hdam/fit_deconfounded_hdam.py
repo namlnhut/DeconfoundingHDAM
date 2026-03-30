@@ -53,7 +53,7 @@ def _svd_full(X: np.ndarray):
 # Spectral (trim) transformation
 # ---------------------------------------------------------------------------
 
-def _calc_trim_factors(X: np.ndarray):
+def _calc_trim_factors(X: np.ndarray, precomputed_svd=None):
     """
     Compute the SVD factors of the trim transformation without forming Q.
 
@@ -68,14 +68,23 @@ def _calc_trim_factors(X: np.ndarray):
     For k = min(n, p) << n this implicit form costs O(n*k) vs O(n^2).
     Even when k = n (p >= n), the (n, n) allocation is avoided.
 
+    Parameters
+    ----------
+    precomputed_svd : tuple (U, d) or None
+        Pre-computed thin SVD of X.  When provided, the SVD step is skipped,
+        saving ~1.4s per call on this OpenBLAS build.
+
     Returns
     -------
     U : ndarray (n, k)
     w : ndarray (k,)
     """
-    # Use GPU-accelerated SVD when available.  On this OpenBLAS build,
-    # np.linalg.svd for a (300, p) matrix takes ~1.4s; GPU takes ~15ms.
-    U, d = _svd_full(X)
+    if precomputed_svd is not None:
+        U, d = precomputed_svd
+    else:
+        # Use GPU-accelerated SVD when available.  On this OpenBLAS build,
+        # np.linalg.svd for a (300, p) matrix takes ~1.4s; GPU takes ~15ms.
+        U, d = _svd_full(X)
     d_tilde = np.minimum(d, np.median(d))
     w = 1.0 - d_tilde / d
     return U, w
@@ -164,22 +173,28 @@ def _build_basis(X: np.ndarray, K: int):
     unpen_mask : ndarray (1 + p*K,) bool
     """
     n, p = X.shape
-    B = np.zeros((n, p * K))
-    Rlist = []
     lbreaks = []
+    all_Bj = []
+    grams = np.empty((p, K, K))
 
     for j in range(p):
         breaks = np.quantile(X[:, j], np.linspace(0, 1, K - 2))
         lbreaks.append(breaks)
+        Bj = bspline_basis(X[:, j], breaks)   # (n, K)
+        all_Bj.append(Bj)
+        grams[j] = Bj.T @ Bj / n
 
-        Bj = bspline_basis(X[:, j], breaks)          # (n, K)
-        gram = Bj.T @ Bj / n                          # (K, K)
-        # scipy_cholesky with lower=False returns the upper factor R directly
-        # (R^T R = gram), equivalent to R's chol().  solve_triangular avoids
-        # forming the explicit inverse: B_orth = Bj R^{-1} = solve(R, Bj^T)^T.
-        R_upper = scipy_cholesky(gram, lower=False)   # upper triangular
-        B[:, j * K:(j + 1) * K] = solve_triangular(R_upper, Bj.T, lower=False).T
-        Rlist.append(R_upper)
+    # Batch Cholesky over all p predictors at once, replacing p individual
+    # scipy_cholesky calls on tiny (K, K) matrices with a single numpy call.
+    # np.linalg.cholesky returns the lower triangular factor L s.t. L @ L.T = gram;
+    # the upper factor used by solve_triangular is R_upper = L.T.
+    L_batch = np.linalg.cholesky(grams)          # (p, K, K) lower triangular
+    R_upper_batch = L_batch.swapaxes(-1, -2)     # (p, K, K) upper triangular
+
+    B = np.empty((n, p * K))
+    for j, Bj in enumerate(all_Bj):
+        B[:, j * K:(j + 1) * K] = solve_triangular(R_upper_batch[j], Bj.T, lower=False).T
+    Rlist = list(R_upper_batch)
 
     # Prepend intercept column
     B_full = np.column_stack([np.ones(n), B])         # (n, 1 + p*K)
@@ -224,9 +239,7 @@ def _cv_hdam(
 
         coefs = group_lasso_path(QB_train, QY_train, groups, lambdas, unpen_mask)
         preds = QB_test @ coefs  # (n_test, n_lam)
-
-        for li in range(n_lam):
-            mses[li, fold] = np.mean((QY_test - preds[:, li]) ** 2)
+        mses[:, fold] = np.mean((QY_test[:, None] - preds) ** 2, axis=0)
 
     mse_agg = mses.mean(axis=1)
     se_agg = mses.std(axis=1) / np.sqrt(k)
@@ -256,6 +269,7 @@ def _deconfounded_hdam(
     cv_method: str = "1se",
     cv_k: int = 5,
     n_lambda: int = 20,
+    precomputed_svd=None,
 ) -> dict:
     """
     Fit deconfounded HDAM for a fixed number of basis functions K.
@@ -270,7 +284,7 @@ def _deconfounded_hdam(
     if meth == "trim":
         # Apply Q implicitly via (U, w) factors to avoid forming the (n, n)
         # Q matrix and the O(n^2) matrix-matrix product Q @ B.
-        U, w = _calc_trim_factors(X)
+        U, w = _calc_trim_factors(X, precomputed_svd=precomputed_svd)
         QY = _apply_Q(Y, U, w)
         QB = _apply_Q(B, U, w)
     elif meth == "none":
@@ -325,6 +339,7 @@ def fit_deconfounded_hdam(
     cv_k: int = 5,
     n_lambda1: int = 15,
     n_lambda2: int = 30,
+    precomputed_svd=None,
 ) -> dict:
     """
     Fit a deconfounded high-dimensional additive model (HDAM).
@@ -364,6 +379,11 @@ def fit_deconfounded_hdam(
         active    : list of int        (0-indexed active predictor indices)
         K_min     : int               (selected number of basis functions)
         Xmeans    : ndarray (p,)      (column means used for centring)
+    precomputed_svd : tuple (U, d) or None
+        Pre-computed thin SVD of the *centred* X matrix.  When provided the
+        SVD step inside this function is skipped.  Pass this when calling
+        fit_deconfounded_hdam and fit_hdam_with_est_factors from the same
+        one_sim to avoid recomputing the SVD 3-4 times per simulation.
     """
     n, p = X.shape
 
@@ -383,7 +403,7 @@ def fit_deconfounded_hdam(
     # Q matrix and keeps the per-K cost at O(n * k * (1 + p*K)) instead of
     # O(n^2 * (1 + p*K)), where k = min(n, p).
     if meth == "trim":
-        U, w = _calc_trim_factors(X)
+        U, w = _calc_trim_factors(X, precomputed_svd=precomputed_svd)
         QY = _apply_Q(Y, U, w)
     elif meth == "none":
         U, w = None, None
@@ -432,9 +452,7 @@ def fit_deconfounded_hdam(
                 modK["groups"], modK["lambdas"], modK["unpen_mask"],
             )
             preds = QB_test @ coefs  # (n_test, n_lambda1)
-
-            for li in range(n_lambda1):
-                MSES_agg[i, li] += np.mean((QY_test - preds[:, li]) ** 2) / cv_k
+            MSES_agg[i] += np.mean((QY_test[:, None] - preds) ** 2, axis=0) / cv_k
 
     # Best (K, lambda) pair
     idx_min = np.unravel_index(np.argmin(MSES_agg), MSES_agg.shape)
@@ -448,6 +466,7 @@ def fit_deconfounded_hdam(
         cv_method=cv_method,
         cv_k=cv_k,
         n_lambda=n_lambda2,
+        precomputed_svd=precomputed_svd,
     )
     result["K_min"] = K_min
     result["Xmeans"] = Xmeans

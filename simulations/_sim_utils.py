@@ -47,16 +47,41 @@ METHS = ["deconfounded", "estimated factors", "naive"]
 # Parallel runner
 # ---------------------------------------------------------------------------
 
-def run_parallel(fn, args_list: list, n_cores: int = 4) -> list:
+def make_pool(n_cores: int):
+    """
+    Create a reusable spawn-context process pool.
+
+    Returns None when n_cores <= 1 (sequential mode).  The caller is
+    responsible for calling pool.terminate() / pool.join() when done, or
+    using the pool as a context manager (``with make_pool(k) as pool``).
+    """
+    if n_cores <= 1:
+        return None
+    ctx = mp.get_context("spawn")
+    return ctx.Pool(n_cores)
+
+
+def run_parallel(fn, args_list: list, n_cores: int = 4, pool=None) -> list:
     """
     Run fn(*args) for every args in args_list using n_cores processes.
     Falls back to sequential execution when n_cores == 1.
+
+    Parameters
+    ----------
+    pool : multiprocessing.Pool or None
+        A pre-created pool to reuse across multiple calls.  When provided,
+        the pool is used directly and not closed afterwards, which avoids
+        the per-batch spawn + CUDA-init overhead (~300 ms × n_cores) that
+        would occur if a new pool were created for every batch.
+        When None, a fresh pool is created and destroyed for this call.
     """
     if n_cores == 1:
         return [fn(*a) for a in args_list]
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(n_cores) as pool:
+    if pool is not None:
         return pool.starmap(fn, args_list)
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(n_cores) as p:
+        return p.starmap(fn, args_list)
 
 
 # ---------------------------------------------------------------------------
